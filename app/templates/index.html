@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Entra External ID OBO Demo</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #f0f2f5; color: #333; margin: 0; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); }
+        h1 { color: #0078d4; border-bottom: 2px solid #0078d4; padding-bottom: 10px; margin-top: 0; }
+        
+        .grid-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+        
+        .token-section { border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #fff; }
+        .token-header { background: #0078d4; color: white; padding: 10px 15px; font-weight: bold; font-size: 0.9rem; }
+        .token-header.id-token { background: #512bd4; } /* .NET/MS風の紫 */
+        
+        .token-body { padding: 15px; background: #fafafa; }
+        .raw-token { font-family: monospace; font-size: 0.7rem; background: #2d2d2d; color: #adbac7; padding: 10px; border-radius: 4px; word-break: break-all; margin-bottom: 15px; max-height: 60px; overflow-y: auto; }
+        
+        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: white; }
+        th, td { border: 1px solid #eee; padding: 6px 10px; text-align: left; }
+        th { background: #f8f9fa; width: 35%; color: #666; }
+        .claim-key { font-weight: bold; color: #0078d4; }
+        
+        .btn { cursor: pointer; border: none; border-radius: 4px; padding: 12px 20px; font-weight: bold; transition: 0.2s; display: inline-block; text-align: center; }
+        .btn-primary { background: #0078d4; color: white; width: 100%; font-size: 1.1rem; margin-top: 20px; }
+        .btn-primary:hover { background: #005a9e; }
+        .btn-logout { background: #d11a2a; color: white; float: right; text-decoration: none; padding: 8px 15px; font-size: 0.8rem; }
+        
+        #result-area { margin-top: 25px; padding: 20px; background: #e7f3ff; border-radius: 8px; display: none; border: 1px dashed #0078d4; }
+        pre { background: #1e1e1e; color: #9cdcfe; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 0.85rem; }
+        .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; background: #dff6dd; color: #107c10; font-weight: bold; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <a href="/logout" class="btn-logout">ログアウト</a>
+    <h1>Entra External ID OBO Demo</h1>
+
+    {% if not user_access_token %}
+        <div style="text-align: center; padding: 40px 0;">
+            <p>PKCE と OBO フローを使用して、ID トークンとアクセストークンの挙動を確認します。</p>
+            <button class="btn btn-primary" onclick="location.href='/login'">Microsoft アカウントでログイン</button>
+        </div>
+    {% else %}
+        <p>ようこそ、<strong>{{ user_name }}</strong> さん</p>
+        <span class="status-badge">認証ステータス: 成功 (PKCE/Nonce 検証済み)</span>
+        
+        <button id="call-btn" class="btn btn-primary">FastMCP を呼び出す (OBO フロー実行)</button>
+
+        <div class="grid-layout">
+            <!-- ID Token の表示 -->
+            <div class="token-section">
+                <div class="token-header id-token">ID Token (ユーザー情報証明書)</div>
+                <div class="token-body">
+                    <div class="raw-token" id="raw-id-token">{{ user_id_token }}</div>
+                    <table id="id-token-table">
+                        <thead><tr><th>Claim</th><th>Value</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Access Token の表示 -->
+            <div class="token-section">
+                <div class="token-header">Access Token (API 呼び出し用鍵)</div>
+                <div class="token-body">
+                    <div class="raw-token" id="raw-access-token">{{ user_access_token }}</div>
+                    <table id="access-token-table">
+                        <thead><tr><th>Claim</th><th>Value</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="result-area">
+            <h3>FastMCP からの応答:</h3>
+            <p style="font-size: 0.8rem; color: #555;">Flask が保持する Access Token を <strong>Assertion</strong> として、API専用トークンに交換しました。</p>
+            <pre id="json-output"></pre>
+        </div>
+    {% endif %}
+</div>
+
+<script>
+    function parseJwt(token) {
+        try {
+            const base64Url = token.split('.')[1];
+            const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+            const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => 
+                '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)
+            ).join(''));
+            return JSON.parse(jsonPayload);
+        } catch (e) { return null; }
+    }
+
+    function renderClaims(token, tableId) {
+        const claims = parseJwt(token);
+        const tbody = document.querySelector(`#${tableId} tbody`);
+        if (!claims) return;
+
+        Object.entries(claims).forEach(([key, value]) => {
+            const row = document.createElement('tr');
+            let displayValue = value;
+            
+            if (['iat', 'exp', 'nbf', 'auth_time'].includes(key)) {
+                displayValue = `<span title="${value}">${new Date(value * 1000).toLocaleString()}</span>`;
+            } else if (Array.isArray(value)) {
+                displayValue = value.join(', ');
+            } else if (typeof value === 'object') {
+                displayValue = JSON.stringify(value);
+            }
+
+            row.innerHTML = `<td class="claim-key">${key}</td><td>${displayValue}</td>`;
+            tbody.appendChild(row);
+        });
+    }
+
+    // 初期表示
+    const idTokenStr = "{{ user_id_token }}";
+    const accessTokenStr = "{{ user_access_token }}";
+    
+    if (idTokenStr) renderClaims(idTokenStr, 'id-token-table');
+    if (accessTokenStr) renderClaims(accessTokenStr, 'access-token-table');
+
+    // API 呼び出し
+    document.getElementById('call-btn')?.addEventListener('click', async () => {
+        const btn = document.getElementById('call-btn');
+        const resultArea = document.getElementById('result-area');
+        const output = document.getElementById('json-output');
+
+        btn.disabled = true;
+        btn.innerHTML = '🔄 OBO トークン交換中...';
+
+        try {
+            const response = await fetch('/call-mcp');
+            const data = await response.json();
+            resultArea.style.display = 'block';
+            output.textContent = JSON.stringify(data, null, 2);
+            window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        } catch (err) {
+            alert('通信エラーが発生しました');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = 'FastMCP を呼び出す (OBO フロー実行)';
+        }
+    });
+</script>
+</body>
+</html>

@@ -1,0 +1,164 @@
+import os
+import requests
+import uuid
+import secrets
+import hashlib
+import base64
+from dotenv import load_dotenv
+from flask import Flask, redirect, url_for, session, request, jsonify, render_template
+from jose import jwt  # id_token のデコードに使用
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=True)
+# ================= 設定セクション =================
+TENANT_DOMAIN = os.getenv("TENANT_DOMAIN")  
+TENANT_ID = os.getenv("TENANT_ID")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+BACKEND_CLIENT_ID = os.getenv("BACKEND_CLIENT_ID")
+
+AUTHORITY = f"https://{TENANT_DOMAIN}/{TENANT_ID}"
+AUTH_ENDPOINT = f"{AUTHORITY}/oauth2/v2.0/authorize"
+TOKEN_ENDPOINT = f"{AUTHORITY}/oauth2/v2.0/token"
+
+SCOPE_FOR_LOGIN = "email offline_access openid profile"
+SCOPE_FOR_OBO = f"api://{BACKEND_CLIENT_ID}/access_as_user"
+
+# ログアウト後の戻り先 URL (Entra ID の管理画面で「フロントチャネル ログアウト URL」等に登録が必要な場合があります)
+POST_LOGOUT_REDIRECT_URI = "http://localhost:5000"
+# =================================================
+
+
+def generate_pkce_pair():
+    """PKCE用の verifier と challenge を生成する"""
+    # 1. code_verifier: 43〜128文字のランダム文字列
+    verifier = secrets.token_urlsafe(64)
+    
+    # 2. code_challenge: verifierをSHA256ハッシュ化 -> Base64URLエンコード
+    sha256_hash = hashlib.sha256(verifier.encode('utf-8')).digest()
+    challenge = base64.urlsafe_b64encode(sha256_hash).decode('utf-8').replace('=', '')
+    
+    return verifier, challenge
+
+@app.route("/")
+def index():
+    user_name = session.get("user_name")
+    user_id_token = session.get("user_id_token")
+    user_access_token = session.get("user_access_token")
+    return render_template("index.html", user_name=user_name, user_id_token=user_id_token, user_access_token=user_access_token)
+
+@app.route("/login")
+def login():
+    nonce = secrets.token_urlsafe(32)
+    state = str(uuid.uuid4())
+    
+    # PKCE ペアの生成
+    code_verifier, code_challenge = generate_pkce_pair()
+    
+    # 検証用にすべてセッションに保存
+    session["auth_nonce"] = nonce
+    session["auth_state"] = state
+    session["code_verifier"] = code_verifier 
+
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": url_for("authorized", _external=True),
+        "response_mode": "query",
+        "scope": SCOPE_FOR_LOGIN,
+        "state": state,
+        "nonce": nonce,
+        # PKCE パラメータを追加
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256"
+    }
+    auth_url = f"{AUTH_ENDPOINT}?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+    return redirect(auth_url)
+
+@app.route("/getAToken")
+def authorized():
+    # state の検証
+    if request.args.get("state") != session.get("auth_state"):
+        return "State mismatch error", 400
+
+    code = request.args.get("code")
+    if not code:
+        error_msg = request.args.get("error_description")
+        return f"Authorization code missing: {error_msg}", 400
+
+    # トークン交換リクエストの構築
+    data = {
+        "client_id": CLIENT_ID,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": url_for("authorized", _external=True),
+        "client_secret": CLIENT_SECRET,
+        # PKCE: 生の verifier を送る
+        "code_verifier": session.get("code_verifier")
+    }
+    
+    resp_json = requests.post(TOKEN_ENDPOINT, data=data).json()
+    
+    if "error" in resp_json:
+        return jsonify(resp_json), 400
+
+    # nonce の検証
+    id_token = resp_json.get("id_token")
+    try:
+        id_claims = jwt.get_unverified_claims(id_token)
+        if id_claims.get("nonce") != session.get("auth_nonce"):
+            return "Nonce validation failed", 400
+        session["user_name"] = id_claims.get("name", "Unknown User")
+    except Exception as e:
+        return f"Token error: {str(e)}", 400
+
+    session["user_access_token"] = resp_json.get("access_token")
+    session["user_id_token"] = resp_json.get("id_token")
+    
+    # 使い終わった一時情報を削除
+    session.pop("auth_nonce", None)
+    session.pop("auth_state", None)
+    session.pop("code_verifier", None)
+    
+    return redirect(url_for("index"))
+
+@app.route("/call-mcp")
+def call_mcp():
+    # (前回と同様の OBO 処理)
+    obo_data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": session.get("user_access_token"),
+        "requested_token_use": "on_behalf_of",
+        "scope": SCOPE_FOR_OBO,
+    }
+    obo_resp = requests.post(TOKEN_ENDPOINT, data=obo_data).json()
+    if "error" in obo_resp: return jsonify(obo_resp), 400
+
+    headers = {"Authorization": f"Bearer {obo_resp.get('access_token')}"}
+    try:
+        response = requests.get("http://localhost:8000/mcp", headers=headers)
+        return response.json()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/logout")
+def logout():
+    # 1. Flask アプリ側のセッションをクリア
+    session.clear()
+
+    # 2. Entra ID の共通ログアウトエンドポイントを構築
+    # post_logout_redirect_uri を指定すると、Entra ID でのログアウト後にアプリに戻ってこれます
+    logout_url = (
+        f"https://sawadysso.ciamlogin.com/{TENANT_ID}/oauth2/v2.0/logout"
+        f"?post_logout_redirect_uri={POST_LOGOUT_REDIRECT_URI}"
+    )
+    
+    # 3. Entra ID のログアウト画面へ飛ばす
+    return redirect(logout_url)
+
+if __name__ == "__main__":
+    app.run(host="localhost", port=5000, debug=True)
