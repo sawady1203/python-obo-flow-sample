@@ -42,6 +42,58 @@ def generate_pkce_pair():
     
     return verifier, challenge
 
+def verify_token(token: str, audience: str):
+    """
+    jwt の検証を行う関数
+     - 署名検証に失敗した場合は例外を投げる
+     - 検証する要素は以下
+        - 署名
+        - aud (Audience)
+        - exp (Expiration Time)
+    """
+    try:
+        # 1. Microsoft の公開鍵(JWKS)エンドポイントを取得
+        config = requests.get(DISCOVERY_URL).json()
+        jwks_uri = config.get("jwks_uri")
+        jwks = requests.get(jwks_uri).json()
+
+        # 2. トークンのヘッダーから kid (Key ID) を取得
+        unverified_header = jwt.get_unverified_header(token)
+        kid = unverified_header.get("kid")
+
+        # 3. JWKS から一致する公開鍵を探す
+        rsa_key = {}
+        for key in jwks["keys"]:
+            if key["kid"] == kid:
+                rsa_key = {
+                    "kty": key["kty"],
+                    "kid": key["kid"],
+                    "use": key["use"],
+                    "n": key["n"],
+                    "e": key["e"]
+                }
+                break
+        
+        if not rsa_key:
+            raise Exception("Public key not found.")
+
+        # 4. 署名の検証を実行
+        payload = jwt.decode(
+            token,
+            rsa_key,
+            algorithms=["RS256"],
+            audience=CLIENT_ID, # 自身のClientID宛かチェック
+            options={"verify_at_hash": False}
+        )
+        if payload.get("aud") != audience:
+            raise Exception("Audience mismatch")
+        if payload.get("exp") < time.time():
+            raise Exception("Token has expired")
+        return token
+    except Exception as e:
+        print(f"Token Verification Failed: {str(e)}")
+        return None
+
 @app.route("/")
 def index():
     user_name = session.get("user_name")
