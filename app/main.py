@@ -22,8 +22,9 @@ BACKEND_CLIENT_ID = os.getenv("BACKEND_CLIENT_ID")
 AUTHORITY = f"https://{TENANT_DOMAIN}/{TENANT_ID}"
 AUTH_ENDPOINT = f"{AUTHORITY}/oauth2/v2.0/authorize"
 TOKEN_ENDPOINT = f"{AUTHORITY}/oauth2/v2.0/token"
+DISCOVERY_URL = f"{AUTHORITY}/.well-known/openid-configuration"
 
-SCOPE_FOR_LOGIN = "email offline_access openid profile"
+SCOPE_FOR_LOGIN = f"email offline_access openid profile api://{CLIENT_ID}/access_as_user"
 SCOPE_FOR_OBO = f"api://{BACKEND_CLIENT_ID}/access_as_user"
 
 # ログアウト後の戻り先 URL (Entra ID の管理画面で「フロントチャネル ログアウト URL」等に登録が必要な場合があります)
@@ -164,11 +165,22 @@ def authorized():
             return "Nonce validation failed", 400
         session["user_name"] = id_claims.get("name", "Unknown User")
     except Exception as e:
-        return f"Token error: {str(e)}", 400
+        return f"id_token error: {str(e)}", 400
 
-    session["user_access_token"] = resp_json.get("access_token")
-    session["user_id_token"] = resp_json.get("id_token")
-    
+    # id_tokenのjwt検証
+    try:
+        verified_id_token = verify_token(id_token, CLIENT_ID)
+        session["user_id_token"] = verified_id_token
+    except Exception as e:
+        return f"id_token verification failed: {str(e)}", 400
+
+    # access_tokenのjwt検証
+    try:
+        verified_access_token = verify_token(resp_json.get("access_token"), CLIENT_ID)
+        session["user_access_token"] = verified_access_token
+    except Exception as e:
+        return f"access_token verification failed: {str(e)}", 400
+
     # 使い終わった一時情報を削除
     session.pop("auth_nonce", None)
     session.pop("auth_state", None)
