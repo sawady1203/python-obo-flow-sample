@@ -193,8 +193,13 @@ def authorized():
     return redirect(url_for("index"))
 
 @app.route("/call-mcp")
-def call_mcp():
-    # (前回と同様の OBO 処理)
+async def call_mcp():
+    """
+    1. Entra External ID から OBO トークンを取得
+        - ここでは、ユーザーアクセストークンを assertion として、MCP用の OBO トークンを取得します
+    2. MCP SSEエンドポイントに接続する際に、Authorizationヘッダーに Bearer {MCP用OBOトークン} を付与して接続
+    3. ツール呼び出しのレスポンスを返す
+    """
     obo_data = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -205,13 +210,50 @@ def call_mcp():
     }
     obo_resp = requests.post(TOKEN_ENDPOINT, data=obo_data).json()
     if "error" in obo_resp: return jsonify(obo_resp), 400
+    mcp_access_token = obo_resp.get("access_token")
+    print(f"Obtained OBO token for MCP: {mcp_access_token}")
 
-    headers = {"Authorization": f"Bearer {obo_resp.get('access_token')}"}
+    mcp_server_url = f"http://localhost:8000/mcp"
+    
+    headers = {
+        "Authorization": f"Bearer {mcp_access_token}"
+    }
+
     try:
-        response = requests.get("http://localhost:8000/mcp", headers=headers)
-        return response.json()
+        # 4. SSE 接続の確立
+        async with streamable_http_client(mcp_server_url) as (read, write, get_session_id):
+            # 5. MCP セッションの開始
+            async with ClientSession(read, write) as mcp_session:
+                # サーバーとのハンドシェイク
+                await mcp_session.initialize()
+                
+                if (session_id := get_session_id()) is not None:
+                    print("Session ID:", session_id)
+                print("---")
+
+                # ツールの呼び出し
+                # main.py で @mcp.tool() 定義した関数名を指定
+                result = await mcp_session.call_tool("get_secure_data")
+                print("Tool call result:", result)
+                # result.content がオブジェクトのリストなので文字列化して返す
+                content_text = ""
+                for item in result.content:
+                    content_text += str(item)
+
+                return jsonify({
+                    "status": "success",
+                    "mcp_response": content_text
+                })
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # TaskGroup エラーの背後にある本当の例外を表示
+        import traceback
+        print("--- MCP Connection Error Detail ---")
+        print(traceback.format_exc())
+        return jsonify({
+            "status": "error",
+            "message": str(e.response.text) if hasattr(e, "response") else str(e)
+        }), 500
 
 @app.route("/logout")
 def logout():
