@@ -6,8 +6,8 @@ import uuid
 import secrets
 import hashlib
 import base64
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+from fastmcp import Client
+from fastmcp.client.auth import BearerAuth
 from dotenv import load_dotenv
 from flask import Flask, redirect, url_for, session, request, jsonify, render_template
 from jose import jwt  # id_token のデコードに使用
@@ -215,45 +215,22 @@ async def call_mcp():
 
     mcp_server_url = f"http://localhost:8000/mcp"
     
-    headers = {
-        "Authorization": f"Bearer {mcp_access_token}"
-    }
+    # 4. SSE 接続の確立
+    async with Client(
+        mcp_server_url,
+        auth=BearerAuth(mcp_access_token),
+    ) as client:
+        result = await client.call_tool("get_secure_data")
+        print("Tool call result:", result)
+        # ツールの呼び出し
+        content_text = ""
+        for item in result.content:
+            content_text += str(item)
 
-    try:
-        # 4. SSE 接続の確立
-        async with streamable_http_client(mcp_server_url) as (read, write, get_session_id):
-            # 5. MCP セッションの開始
-            async with ClientSession(read, write) as mcp_session:
-                # サーバーとのハンドシェイク
-                await mcp_session.initialize()
-                
-                if (session_id := get_session_id()) is not None:
-                    print("Session ID:", session_id)
-                print("---")
-
-                # ツールの呼び出し
-                # main.py で @mcp.tool() 定義した関数名を指定
-                result = await mcp_session.call_tool("get_secure_data")
-                print("Tool call result:", result)
-                # result.content がオブジェクトのリストなので文字列化して返す
-                content_text = ""
-                for item in result.content:
-                    content_text += str(item)
-
-                return jsonify({
-                    "status": "success",
-                    "mcp_response": content_text
-                })
-
-    except Exception as e:
-        # TaskGroup エラーの背後にある本当の例外を表示
-        import traceback
-        print("--- MCP Connection Error Detail ---")
-        print(traceback.format_exc())
         return jsonify({
-            "status": "error",
-            "message": str(e.response.text) if hasattr(e, "response") else str(e)
-        }), 500
+            "status": "success",
+            "mcp_response": content_text
+        })
 
 @app.route("/logout")
 def logout():
